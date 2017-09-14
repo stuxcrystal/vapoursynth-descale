@@ -1,4 +1,4 @@
-/* 
+/*
  * Copyright © 2017 Frechdachs <frechdachs@rekt.cc>
  * This program is free software. It comes without any warranty, to
  * the extent permitted by applicable law. You can redistribute it
@@ -16,6 +16,17 @@
 #include <vector>
 #include <vapoursynth/VapourSynth.h>
 #include <vapoursynth/VSHelper.h>
+#include <iostream>
+
+
+typedef enum DescaleMode
+{
+    bilinear = 0,
+    bicubic  = 1,
+    lanczos  = 2,
+    spline16 = 3,
+    spline36 = 4
+} DescaleMode;
 
 
 struct DescaleData
@@ -40,18 +51,9 @@ struct DescaleData
     std::vector<int> weights_v_left_idx;
     std::vector<int> weights_h_right_idx;
     std::vector<int> weights_v_right_idx;
+    DescaleMode mode;
+    int support;
 };
-
-
-typedef enum DescaleMode
-{
-    bilinear = 0,
-    bicubic  = 1,
-    lanczos  = 2,
-    spline16 = 3,
-    spline36 = 4
-} DescaleMode;
-
 
 static std::vector<double> transpose_matrix(int rows, const std::vector<double> &matrix)
 {
@@ -254,7 +256,7 @@ static double calculate_weight(DescaleMode mode, int support, double distance, d
         if (distance < 1)
             return ((12 - 9 * b - 6 * c) * cube(distance)
                         + (-18 + 12 * b + 6 * c) * square(distance) + (6 - 2 * b)) / 6.0;
-        else if (distance < 2) 
+        else if (distance < 2)
             return ((-b - 6 * c) * cube(distance) + (6 * b+ 30 * c) * square(distance)
                         + (-12 * b - 48 * c) * distance + (8 * b + 24 * c)) / 6.0;
         else
@@ -304,7 +306,7 @@ static double round_halfup(double x) noexcept
 }
 
 
-// Most of this is taken from zimg 
+// Most of this is taken from zimg
 // https://github.com/sekrit-twc/zimg/blob/ce27c27f2147fbb28e417fbf19a95d3cf5d68f4f/src/zimg/resize/filter.cpp#L227
 static std::vector<double> scaling_weights(DescaleMode mode, int support, int src_dim, int dst_dim, double b, double c, double shift)
 {
@@ -390,7 +392,7 @@ static void process_plane_v(int height, int current_width, int &current_height, 
 {
     int c = (bandwidth + 1) / 2;
     int columns = weights.size() / height;
-    for (int i = 0; i < current_width; ++i) { 
+    for (int i = 0; i < current_width; ++i) {
 
         // Solve LD y = A' b
         for (int j = 0; j < height; ++j) {
@@ -430,6 +432,97 @@ static const VSFrameRef *VS_CC descale_get_frame(int n, int activationReason, vo
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
+        if (d->process_h) {
+            std::vector<double> weights = scaling_weights(d->mode, d->support, d->vi_dst.width, d->vi.width, d->b, d->c, d->shift_h);
+            std::vector<double> transposed_weights = transpose_matrix(d->vi.width, weights);
+
+            d->weights_h_left_idx.resize(d->vi_dst.width);
+            d->weights_h_right_idx.resize(d->vi_dst.width);
+            for (int i = 0; i < d->vi_dst.width; ++i) {
+                for (int j = 0; j < d->vi.width; ++j) {
+                    if (transposed_weights[i * d->vi.width + j] != 0.0) {
+                        d->weights_h_left_idx[i] = j;
+                        break;
+                    }
+                }
+                for (int j = d->vi.width - 1; j >= 0; --j) {
+                    if (transposed_weights[i * d->vi.width + j] != 0.0) {
+                        d->weights_h_right_idx[i] = j + 1;
+                        break;
+                    }
+                }
+            }
+
+            std::vector<double> multiplied_weights = multiply_sparse_matrices(d->vi_dst.width, d->weights_h_left_idx, d->weights_h_right_idx, transposed_weights, weights);
+
+            std::vector<double> upper (d->vi_dst.width * d->vi_dst.width, 0);
+            upper = compress_symmetric_banded_matrix(d->vi_dst.width, d->bandwidth, multiplied_weights);
+            banded_ldlt_decomposition(d->vi_dst.width, d->bandwidth, upper);
+            upper = uncrompress_symmetric_banded_matrix(d->vi_dst.width, d->bandwidth, upper);
+            std::vector<double> lower = transpose_matrix(d->vi_dst.width, upper);
+            multiply_banded_matrix_with_diagonal(d->vi_dst.width, d->bandwidth, lower);
+
+            transposed_weights = compress_matrix(d->vi_dst.width, d->weights_h_left_idx, d->weights_h_right_idx, transposed_weights);
+
+            int compressed_columns = transposed_weights.size() / d->vi_dst.width;
+            d->weights_h.resize(d->vi_dst.width * compressed_columns, 0);
+            d->diagonal_h.resize(d->vi_dst.width, 0);
+            d->lower_h.resize(d->vi_dst.width * ((d->bandwidth + 1) / 2 - 1), 0);
+            d->upper_h.resize(d->vi_dst.width * ((d->bandwidth + 1) / 2 - 1), 0);
+
+            extract_compressed_lower_upper_diagonal(d->vi_dst.width, d->bandwidth, lower, upper, d->lower_h, d->upper_h, d->diagonal_h);
+            for (int i = 0; i < d->vi_dst.width; ++i) {
+                for (int j = 0; j < compressed_columns; ++j) {
+                    d->weights_h[i * compressed_columns + j] = static_cast<float>(transposed_weights[i * compressed_columns + j]);
+                }
+            }
+        }
+
+        if (d->process_v) {
+            std::vector<double> weights = scaling_weights(d->mode, d->support, d->vi_dst.height, d->vi.height, d->b, d->c, d->shift_v);
+            std::vector<double> transposed_weights = transpose_matrix(d->vi.height, weights);
+
+            d->weights_v_left_idx.resize(d->vi_dst.height);
+            d->weights_v_right_idx.resize(d->vi_dst.height);
+            for (int i = 0; i < d->vi_dst.height; ++i) {
+                for (int j = 0; j < d->vi.height; ++j) {
+                    if (transposed_weights[i * d->vi.height + j] != 0.0) {
+                        d->weights_v_left_idx[i] = j;
+                        break;
+                    }
+                }
+                for (int j = d->vi.height - 1; j >= 0; --j) {
+                    if (transposed_weights[i * d->vi.height + j] != 0.0) {
+                        d->weights_v_right_idx[i] = j + 1;
+                        break;
+                    }
+                }
+            }
+
+            std::vector<double> multiplied_weights = multiply_sparse_matrices(d->vi_dst.height, d->weights_v_left_idx, d->weights_v_right_idx, transposed_weights, weights);
+
+            std::vector<double> upper (d->vi_dst.height * d->vi_dst.height, 0);
+            upper = compress_symmetric_banded_matrix(d->vi_dst.height, d->bandwidth, multiplied_weights);
+            banded_ldlt_decomposition(d->vi_dst.height, d->bandwidth, upper);
+            upper = uncrompress_symmetric_banded_matrix(d->vi_dst.height, d->bandwidth, upper);
+            std::vector<double> lower = transpose_matrix(d->vi_dst.height, upper);
+            multiply_banded_matrix_with_diagonal(d->vi_dst.height, d->bandwidth, lower);
+
+            transposed_weights = compress_matrix(d->vi_dst.height, d->weights_v_left_idx, d->weights_v_right_idx, transposed_weights);
+
+            int compressed_columns = transposed_weights.size() / d->vi_dst.height;
+            d->weights_v.resize(d->vi_dst.height * compressed_columns, 0);
+            d->diagonal_v.resize(d->vi_dst.height, 0);
+            d->lower_v.resize(d->vi_dst.height * ((d->bandwidth + 1) / 2 - 1), 0);
+            d->upper_v.resize(d->vi_dst.height * ((d->bandwidth + 1) / 2 - 1), 0);
+
+            extract_compressed_lower_upper_diagonal(d->vi_dst.height, d->bandwidth, lower, upper, d->lower_v, d->upper_v, d->diagonal_v);
+            for (int i = 0; i < d->vi_dst.height; ++i) {
+                for (int j = 0; j < compressed_columns; ++j) {
+                    d->weights_v[i * compressed_columns + j] = static_cast<float>(transposed_weights[i * compressed_columns + j]);
+                }
+            }
+        }
 
     } else if (activationReason == arAllFramesReady) {
         const VSFrameRef * src = vsapi->getFrameFilter(n, d->node, frameCtx);
@@ -515,7 +608,7 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *userData, VS
     DescaleMode mode = static_cast<DescaleMode>(reinterpret_cast<std::uintptr_t>(userData));
 
     DescaleData d{};
-
+    d.mode = mode;
     d.node = vsapi->propGetNode(in, "src", 0, nullptr);
     d.vi = *vsapi->getVideoInfo(d.node);
     d.vi_dst = *vsapi->getVideoInfo(d.node);
@@ -551,16 +644,17 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *userData, VS
         return;
     }
 
-    d.process_h = (d.vi_dst.width == d.vi.width) ? false : true;
-    d.process_v = (d.vi_dst.height == d.vi.height) ? false : true;
+    d.process_h = d.vi_dst.width != d.vi.width;
+    d.process_v = d.vi_dst.height != d.vi.height;
 
     int support;
     std::string funcname;
 
     if (mode == bilinear) {
         support = 1;
+        d.support = 1;
         funcname = "Debilinear";
-    
+
     } else if (mode == bicubic) {
         d.b = vsapi->propGetFloat(in, "b", 0, &err);
         if (err)
@@ -571,6 +665,7 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *userData, VS
             d.c = static_cast<double>(1) / 3;
 
         support = 2;
+        d.support = 3;
         funcname = "Debicubic";
 
     } else if (mode == lanczos) {
@@ -585,112 +680,21 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *userData, VS
         }
 
         support = d.taps;
+        d.support = d.taps;
         funcname = "Delanczos";
 
     } else if (mode == spline16) {
         support = 2;
+        d.support = 2;
         funcname = "Despline16";
 
     } else if (mode == spline36) {
         support = 3;
+        d.support = 3;
         funcname = "Despline36";
     }
 
     d.bandwidth = support * 4 - 1;
-
-    if (d.process_h) {
-        std::vector<double> weights = scaling_weights(mode, support, d.vi_dst.width, d.vi.width, d.b, d.c, d.shift_h);
-        std::vector<double> transposed_weights = transpose_matrix(d.vi.width, weights);
-
-        d.weights_h_left_idx.resize(d.vi_dst.width);
-        d.weights_h_right_idx.resize(d.vi_dst.width);
-        for (int i = 0; i < d.vi_dst.width; ++i) {
-            for (int j = 0; j < d.vi.width; ++j) {
-                if (transposed_weights[i * d.vi.width + j] != 0.0) {
-                    d.weights_h_left_idx[i] = j;
-                    break;
-                }
-            }
-            for (int j = d.vi.width - 1; j >= 0; --j) {
-                if (transposed_weights[i * d.vi.width + j] != 0.0) {
-                    d.weights_h_right_idx[i] = j + 1;
-                    break;
-                }
-            }
-        }
-
-        std::vector<double> multiplied_weights = multiply_sparse_matrices(d.vi_dst.width, d.weights_h_left_idx, d.weights_h_right_idx, transposed_weights, weights);
-        
-        std::vector<double> upper (d.vi_dst.width * d.vi_dst.width, 0);
-        upper = compress_symmetric_banded_matrix(d.vi_dst.width, d.bandwidth, multiplied_weights);
-        banded_ldlt_decomposition(d.vi_dst.width, d.bandwidth, upper);
-        upper = uncrompress_symmetric_banded_matrix(d.vi_dst.width, d.bandwidth, upper);
-        std::vector<double> lower = transpose_matrix(d.vi_dst.width, upper);
-        multiply_banded_matrix_with_diagonal(d.vi_dst.width, d.bandwidth, lower);
-
-        transposed_weights = compress_matrix(d.vi_dst.width, d.weights_h_left_idx, d.weights_h_right_idx, transposed_weights);
-        
-        int compressed_columns = transposed_weights.size() / d.vi_dst.width;
-        d.weights_h.resize(d.vi_dst.width * compressed_columns, 0);
-        d.diagonal_h.resize(d.vi_dst.width, 0);
-        d.lower_h.resize(d.vi_dst.width * ((d.bandwidth + 1) / 2 - 1), 0);
-        d.upper_h.resize(d.vi_dst.width * ((d.bandwidth + 1) / 2 - 1), 0);
-
-        extract_compressed_lower_upper_diagonal(d.vi_dst.width, d.bandwidth, lower, upper, d.lower_h, d.upper_h, d.diagonal_h);
-
-        for (int i = 0; i < d.vi_dst.width; ++i) {
-            for (int j = 0; j < compressed_columns; ++j) {
-                d.weights_h[i * compressed_columns + j] = static_cast<float>(transposed_weights[i * compressed_columns + j]);
-            }
-        }
-    }
-
-    if (d.process_v) {
-        std::vector<double> weights = scaling_weights(mode, support, d.vi_dst.height, d.vi.height, d.b, d.c, d.shift_v);
-        std::vector<double> transposed_weights = transpose_matrix(d.vi.height, weights);
-
-        d.weights_v_left_idx.resize(d.vi_dst.height);
-        d.weights_v_right_idx.resize(d.vi_dst.height);
-        for (int i = 0; i < d.vi_dst.height; ++i) {
-            for (int j = 0; j < d.vi.height; ++j) {
-                if (transposed_weights[i * d.vi.height + j] != 0.0) {
-                    d.weights_v_left_idx[i] = j;
-                    break;
-                }
-            }
-            for (int j = d.vi.height - 1; j >= 0; --j) {
-                if (transposed_weights[i * d.vi.height + j] != 0.0) {
-                    d.weights_v_right_idx[i] = j + 1;
-                    break;
-                }
-            }
-        }
-
-        std::vector<double> multiplied_weights = multiply_sparse_matrices(d.vi_dst.height, d.weights_v_left_idx, d.weights_v_right_idx, transposed_weights, weights);
-        
-        std::vector<double> upper (d.vi_dst.height * d.vi_dst.height, 0);
-        upper = compress_symmetric_banded_matrix(d.vi_dst.height, d.bandwidth, multiplied_weights);
-        banded_ldlt_decomposition(d.vi_dst.height, d.bandwidth, upper);
-        upper = uncrompress_symmetric_banded_matrix(d.vi_dst.height, d.bandwidth, upper);
-        std::vector<double> lower = transpose_matrix(d.vi_dst.height, upper);
-        multiply_banded_matrix_with_diagonal(d.vi_dst.height, d.bandwidth, lower);
-
-        transposed_weights = compress_matrix(d.vi_dst.height, d.weights_v_left_idx, d.weights_v_right_idx, transposed_weights);
-        
-        int compressed_columns = transposed_weights.size() / d.vi_dst.height;
-        d.weights_v.resize(d.vi_dst.height * compressed_columns, 0);
-        d.diagonal_v.resize(d.vi_dst.height, 0);
-        d.lower_v.resize(d.vi_dst.height * ((d.bandwidth + 1) / 2 - 1), 0);
-        d.upper_v.resize(d.vi_dst.height * ((d.bandwidth + 1) / 2 - 1), 0);
-
-        extract_compressed_lower_upper_diagonal(d.vi_dst.height, d.bandwidth, lower, upper, d.lower_v, d.upper_v, d.diagonal_v);
-
-        for (int i = 0; i < d.vi_dst.height; ++i) {
-            for (int j = 0; j < compressed_columns; ++j) {
-                d.weights_v[i * compressed_columns + j] = static_cast<float>(transposed_weights[i * compressed_columns + j]);
-            }
-        }
-    }
 
     DescaleData * data = new DescaleData{ d };
     vsapi->createFilter(in, out, funcname.c_str(), descale_init, descale_get_frame, descale_free, fmParallel, 0, data, core);
@@ -699,7 +703,7 @@ static void VS_CC descale_create(const VSMap *in, VSMap *out, void *userData, VS
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin)
 {
-    configFunc("tegaf.asi.xe", "descale", "Undo linear interpolation", VAPOURSYNTH_API_VERSION, 1, plugin);
+    configFunc("test.test.getnative", "descale_getnative", "Undo linear interpolation", VAPOURSYNTH_API_VERSION, 1, plugin);
 
     registerFunc("Debilinear",
             "src:clip;"
